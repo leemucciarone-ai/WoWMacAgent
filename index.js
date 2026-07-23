@@ -36,6 +36,10 @@ const {
   POST_SLOTS = '12:30,16:30,18:00,19:30',
   PATCH_FEEDS = 'https://www.wowhead.com/news/rss/retail,https://www.wowhead.com/news/rss/in-dev',
   PATCH_KEYWORDS = 'hotfix,patch notes,ptr,tuning,class changes,development notes,undocumented,build',
+  YOUTUBE_API_KEY = '',
+  YOUTUBE_QUERY = 'World of Warcraft',
+  YOUTUBE_DAYS = '7',
+  YOUTUBE_MAX = '5',
   SEEN_PATH = './data/seen.json',
   STATE_PATH = './data/state.json',
 } = process.env;
@@ -51,6 +55,7 @@ const discord = new Client({ intents: [GatewayIntentBits.Guilds] });
 const parser = new Parser({ headers: { 'User-Agent': 'Mozilla/5.0 (wow-tweet-bot)' } });
 
 const pending = new Map(); // messageId -> draft (awaiting approval, in your DMs)
+const topicSets = new Map(); // setId -> [{title, link}] backing the /topics buttons
 let scheduled = [];        // [{ id, text, at (ISO), slot }] approved, not yet posted
 let lastAngle = null;
 
@@ -180,9 +185,9 @@ async function generateEvergreen({ angleName = null, steer = [], topic = null, l
 
   // Ground timely tweets in real, recent headlines so nothing gets invented.
   if (!topic && angle.name === 'news_reaction') {
-    const items = await fetchRecentItems();
+    const items = await fetchTopicCandidates();
     if (!items.length) return generateEvergreen({ angleName: 'blizzard_grievance', steer });
-    prompt += `Recent WoW headlines (pick ONE and react to it, only use facts present here):\n` +
+    prompt += `Recent WoW headlines and community videos (pick ONE and react to it, only use facts present here):\n` +
       items.map((i, n) => `${n + 1}. ${i.title}`).join('\n') + `\n\n`;
   }
   if (link) prompt += `A link will be added to the end of this tweet, so keep the text under 240 characters and do not write out any URL yourself.\n\n`;
@@ -241,6 +246,39 @@ async function patchTweetFromNotes(notes, steer = []) {
 // ----------------------------------------------------------------------------
 // Patch-notes watcher — polls feeds, filters to patch/tuning, DMs you + drafts
 // ----------------------------------------------------------------------------
+async function articleTweetFromNotes(title, notes, steer = [], kind = 'news') {
+  const framing = kind === 'youtube'
+    ? `React in one tweet to this WoW video the community is watching. You can agree, disagree, riff on the topic, or react to the take itself. Do not promote the video and do not sound like an ad.`
+    : `React to this WoW news item in one tweet. Respond the way you actually would, do not summarize it like a news anchor.`;
+  let prompt = `${framing}\n` + `HEADLINE: ${title}\n\n`;
+  prompt += notes
+    ? `ARTICLE TEXT (only use facts that actually appear here, invent nothing):\n${notes.slice(0, 4000)}\n\n`
+    : `You only have the headline. React to it without inventing any details.\n\n`;
+  if (steer.length) prompt += steerBlock(steer);
+  prompt += `Reply with ONLY the tweet text. No quotes around it, no label, no explanation, nothing else.`;
+  const res = await anthropic.messages.create({
+    model: MODEL, max_tokens: 300, system: SYSTEM,
+    messages: [{ role: 'user', content: prompt }],
+  });
+  return { angle: 'news_reaction', ...parseDraft(res) };
+}
+
+// Pulls the real article behind a headline so the tweet is grounded in facts.
+async function generateFromItem(item, steer = []) {
+  let notes = item.notes || '';
+  if (!notes) {
+    try { notes = item.link ? await fetchNotes(item.link) : ''; }
+    catch (e) { console.error('article fetch failed:', e.message); }
+  }
+  const kind = item.source === 'youtube' ? 'youtube' : 'news';
+  const draft = await articleTweetFromNotes(item.title, notes, steer, kind);
+  draft.topic = item.title;
+  draft.sourceNotes = notes;
+  draft.sourceKind = kind;
+  draft.suggestedLink = item.link || null;
+  return draft;
+}
+
 // ----------------------------------------------------------------------------
 // Recent WoW happenings (used for timely tweets and the /topics command)
 // ----------------------------------------------------------------------------
@@ -265,6 +303,47 @@ async function fetchRecentItems(limit = 12, days = 7) {
   items.sort((a, b) => b.ts - a.ts);
   const seenTitles = new Set();
   return items.filter((i) => !seenTitles.has(i.title) && seenTitles.add(i.title)).slice(0, limit);
+}
+
+// Most-viewed recent WoW videos. Optional: skipped entirely without an API key.
+async function fetchYouTubeVideos(limit = Number(YOUTUBE_MAX) || 5, days = Number(YOUTUBE_DAYS) || 7) {
+  if (!YOUTUBE_API_KEY) return [];
+  const publishedAfter = new Date(Date.now() - days * 86400000).toISOString();
+  const url = 'https://www.googleapis.com/youtube/v3/search'
+    + `?part=snippet&type=video&order=viewCount&maxResults=${limit}`
+    + `&publishedAfter=${publishedAfter}&q=${encodeURIComponent(YOUTUBE_QUERY)}`
+    + `&key=${YOUTUBE_API_KEY}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`YouTube API ${res.status}`);
+  const data = await res.json();
+  return (data.items || [])
+    .filter((it) => it.id && it.id.videoId && it.snippet)
+    .map((it) => ({
+      title: `${it.snippet.title} \u2014 ${it.snippet.channelTitle}`,
+      link: `https://www.youtube.com/watch?v=${it.id.videoId}`,
+      ts: Date.parse(it.snippet.publishedAt) || Date.now(),
+      source: 'youtube',
+      // The API description is short but real. Used instead of scraping the page,
+      // since a YouTube page body is mostly script and useless as article text.
+      notes: `YouTube video by ${it.snippet.channelTitle}. Title: ${it.snippet.title}. `
+        + `Description: ${it.snippet.description || '(none provided)'}`,
+    }));
+}
+
+// News + videos together, which is what /topics and the news angle both draw from.
+async function fetchTopicCandidates() {
+  const [news, videos] = await Promise.all([
+    fetchRecentItems(10).catch((e) => { console.error('news fetch failed:', e.message); return []; }),
+    fetchYouTubeVideos().catch((e) => { console.error('youtube fetch failed:', e.message); return []; }),
+  ]);
+  const newsTagged = news.map((n) => ({ ...n, source: n.source || 'news' }));
+  if (!videos.length) return newsTagged.slice(0, 10);
+  if (!newsTagged.length) return videos.slice(0, 10);
+  // Keep both visible rather than letting one source crowd the other out.
+  const vidQuota = Math.min(videos.length, 4);
+  return [...newsTagged.slice(0, 10 - vidQuota), ...videos.slice(0, vidQuota)]
+    .sort((a, b) => b.ts - a.ts)
+    .slice(0, 10);
 }
 
 function loadSeen() {
@@ -409,13 +488,29 @@ function buttons() {
   );
 }
 
+function topicButtons(setId, count) {
+  const rows = [];
+  for (let r = 0; r < Math.ceil(count / 5); r += 1) {
+    const row = new ActionRowBuilder();
+    for (let i = r * 5; i < Math.min(count, r * 5 + 5); i += 1) {
+      row.addComponents(
+        new ButtonBuilder().setCustomId(`pick:${setId}:${i}`).setLabel(String(i + 1)).setStyle(ButtonStyle.Secondary),
+      );
+    }
+    rows.push(row);
+  }
+  return rows;
+}
+
 function draftMessage(draft) {
   const steer = Array.isArray(draft.steer) ? draft.steer : [];
   const applied = steer.length
     ? `\n\n_Applied notes: ${steer.map((n) => `\u201C${n}\u201D`).join(' \u2192 ')}_`
     : '';
   return {
-    content: `**Tweet draft** \`(${draft.angle})\`${draft.topic ? ` \u00b7 topic: ${draft.topic}` : ''} \u00b7 ${displayLength(draft)}/280\n>>> ${composeTweet(draft)}` + applied,
+    content: `**Tweet draft** \`(${draft.angle})\`${draft.topic ? ` \u00b7 topic: ${draft.topic}` : ''} \u00b7 ${displayLength(draft)}/280\n>>> ${composeTweet(draft)}`
+      + (!draft.link && draft.suggestedLink ? `\n_source: <${draft.suggestedLink}> (add it with Edit)_` : '')
+      + applied,
     components: [buttons()],
   };
 }
@@ -437,10 +532,18 @@ discord.on('interactionCreate', async (interaction) => {
     if (!gate()) return interaction.reply({ content: 'Approver-only.', ephemeral: true });
     await interaction.deferReply({ ephemeral: true });
     try {
-      const items = await fetchRecentItems();
+      const items = (await fetchTopicCandidates()).slice(0, 10);
       if (!items.length) return interaction.editReply('No recent items found in the feeds.');
-      const lines = items.map((i, n) => `**${n + 1}.** ${i.title}\n<${i.link}>`).join('\n');
-      await interaction.editReply(`Recent WoW headlines:\n${lines}`.slice(0, 1900));
+      const setId = randomUUID().slice(0, 8);
+      topicSets.set(setId, items);
+      while (topicSets.size > 20) topicSets.delete(topicSets.keys().next().value);
+      const lines = items
+        .map((i, n) => `**${n + 1}.** ${i.source === 'youtube' ? '\u25b6 ' : ''}${i.title}`)
+        .join('\n');
+      await interaction.editReply({
+        content: `Recent WoW headlines. Tap a number to draft a tweet about it:\n${lines}`.slice(0, 1900),
+        components: topicButtons(setId, items.length),
+      });
     } catch (err) {
       await interaction.editReply(`Could not fetch topics: ${err.message}`);
     }
@@ -480,6 +583,26 @@ discord.on('interactionCreate', async (interaction) => {
 
   if (interaction.isButton()) {
     if (!gate()) return interaction.reply({ content: 'Approver-only controls.', ephemeral: true });
+
+    // Numbered buttons from /topics
+    if (interaction.customId.startsWith('pick:')) {
+      const [, setId, idxStr] = interaction.customId.split(':');
+      const set = topicSets.get(setId);
+      if (!set) {
+        return interaction.reply({ content: 'That topic list expired. Run /topics again.', ephemeral: true });
+      }
+      const item = set[Number(idxStr)];
+      if (!item) return interaction.reply({ content: 'Could not find that topic.', ephemeral: true });
+      await interaction.reply({ content: `Drafting a tweet about: ${item.title}`, ephemeral: true });
+      try {
+        const fromItem = await generateFromItem(item);
+        await sendDraft(fromItem);
+      } catch (err) {
+        await interaction.followUp({ content: `Could not draft that: ${err.message}`, ephemeral: true });
+      }
+      return;
+    }
+
     const draft = pending.get(interaction.message.id);
     if (!draft) return interaction.reply({ content: 'This draft has expired.', ephemeral: true });
 
@@ -518,7 +641,7 @@ discord.on('interactionCreate', async (interaction) => {
         .setLabel('Link to attach (optional)')
         .setStyle(TextInputStyle.Short)
         .setRequired(false)
-        .setValue(draft.link || '');
+        .setValue(draft.link || draft.suggestedLink || '');
       modal.addComponents(
         new ActionRowBuilder().addComponents(input),
         new ActionRowBuilder().addComponents(linkInput),
@@ -541,6 +664,15 @@ discord.on('interactionCreate', async (interaction) => {
     if (draft.angle === 'patch') {
       fresh = await patchTweetFromNotes(draft.sourceNotes || '', steer);
       fresh.sourceNotes = draft.sourceNotes;
+    } else if (draft.sourceNotes !== undefined && draft.angle === 'news_reaction') {
+      fresh = await articleTweetFromNotes(
+        draft.topic || '', draft.sourceNotes || '', steer, draft.sourceKind || 'news',
+      );
+      fresh.topic = draft.topic || null;
+      fresh.sourceNotes = draft.sourceNotes;
+      fresh.sourceKind = draft.sourceKind || 'news';
+      fresh.suggestedLink = draft.suggestedLink || null;
+      fresh.link = draft.link || null;
     } else {
       fresh = await generateEvergreen({
         angleName: (steer.length || draft.topic) ? draft.angle : null,
