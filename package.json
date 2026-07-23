@@ -1,0 +1,18 @@
+{
+  "name": "wow-tweet-bot",
+  "version": "1.2.0",
+  "description": "Daily evergreen WoW tweet generator with Discord approval, optimal-slot scheduling, and an automatic patch-notes watcher.",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.32.1",
+    "discord.js": "^14.16.3",
+    "dotenv": "^16.4.5",
+    "node-cron": "^3.0.3",
+    "rss-parser": "^3.13.0",
+    "twitter-api-v2": "^1.18.2"
+  }
+}
